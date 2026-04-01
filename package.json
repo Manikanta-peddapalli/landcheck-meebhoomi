@@ -1,11 +1,10 @@
 {
-  "name": "meebhoomi-scraper",
-  "version": "1.0.0",
-  "description": "LandCheck MeeBhoomi Real Data Scraper",
+  "name": "landcheck-meebhoomi",
+  "version": "2.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "build": "node node_modules/puppeteer/install.mjs"
   },
   "dependencies": {
     "express": "^4.18.2",
