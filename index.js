@@ -8,11 +8,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 const PORT = process.env.PORT || 3001;
-const CAPTCHA_KEY = process.env.CAPTCHA_API_KEY || "";
 
-console.log("Mode:", CAPTCHA_KEY ? "REAL DATA" : "DEMO");
+// Store sessions temporarily
+const sessions = {};
 
-// ── Reverse geocode GPS → village ──────────────────────────
+// ── Reverse geocode ────────────────────────────────────────
 async function reverseGeocode(lat, lon) {
   try {
     const res = await axios.get(
@@ -31,53 +31,26 @@ async function reverseGeocode(lat, lon) {
   }
 }
 
-// ── Solve captcha ──────────────────────────────────────────
-async function solveCaptcha(imageUrl, cookies) {
-  if (!CAPTCHA_KEY) return null;
+// ── STEP 1: GPS → Get captcha image from MeeBhoomi ─────────
+app.get("/get-captcha", async (req, res) => {
+  const { lat, lon } = req.query;
+  if (!lat || !lon) return res.status(400).json({ error: "lat and lon required" });
+
+  console.log(`\n=== Get Captcha: ${lat}, ${lon} ===`);
+
   try {
-    // Download captcha image
-    const imgRes = await axios.get(imageUrl, {
-      responseType: "arraybuffer",
-      headers: { "Cookie": cookies, "Referer": "https://meebhoomi.ap.gov.in/" }
-    });
-    const b64 = Buffer.from(imgRes.data).toString("base64");
+    // Get village from GPS
+    const geo = await reverseGeocode(lat, lon);
+    console.log("Location:", geo.village, geo.district);
 
-    // Submit to 2captcha
-    const sub = await axios.post("http://2captcha.com/in.php", {
-      key: CAPTCHA_KEY, method: "base64", body: b64, json: 1
-    });
-    if (sub.data.status !== 1) return null;
-    const id = sub.data.request;
-
-    // Wait for solution
-    for (let i = 0; i < 8; i++) {
-      await new Promise(r => setTimeout(r, 4000));
-      const sol = await axios.get(
-        `http://2captcha.com/res.php?key=${CAPTCHA_KEY}&action=get&id=${id}&json=1`
-      );
-      if (sol.data.status === 1) {
-        console.log("Captcha solved:", sol.data.request);
-        return sol.data.request;
-      }
-    }
-    return null;
-  } catch(e) {
-    console.log("Captcha error:", e.message);
-    return null;
-  }
-}
-
-// ── Fetch MeeBhoomi with Cheerio (lightweight!) ────────────
-async function fetchMeeBhoomi(district, mandal, village) {
-  try {
     const headers = {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.5",
-      "Connection": "keep-alive"
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "te-IN,te;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Connection": "keep-alive",
     };
 
-    // Step 1: Load page
+    // Load MeeBhoomi page
     console.log("Loading MeeBhoomi...");
     const page1 = await axios.get("https://meebhoomi.ap.gov.in/Adangal.aspx", {
       headers, timeout: 20000
@@ -85,40 +58,39 @@ async function fetchMeeBhoomi(district, mandal, village) {
     const cookies = page1.headers["set-cookie"]?.map(c => c.split(";")[0]).join("; ") || "";
     const $ = cheerio.load(page1.data);
 
-    // Extract form fields
     const vs = $("#__VIEWSTATE").val() || "";
     const evv = $("#__EVENTVALIDATION").val() || "";
     const vsg = $("#__VIEWSTATEGENERATOR").val() || "";
 
-    if (!vs) { console.log("No viewstate!"); return null; }
-    console.log("Page loaded, viewstate length:", vs.length);
+    if (!vs) {
+      return res.json({ success: false, message: "MeeBhoomi not loading. Try again." });
+    }
 
     // Get district options
     const distOpts = [];
     $("#ctl00_ContentPlaceHolder1_DropDownList1 option").each((i, el) => {
-      distOpts.push({ v: $(el).val(), t: $(el).text().trim() });
+      const v = $(el).val();
+      const t = $(el).text().trim();
+      if (v) distOpts.push({ v, t });
     });
-    console.log("Districts found:", distOpts.length);
+    console.log("Districts:", distOpts.length);
 
+    // Match district
     const distMatch = distOpts.find(o =>
-      o.t.toLowerCase().includes(district.toLowerCase().replace(" district","").split(" ")[0]) ||
-      district.toLowerCase().includes(o.t.toLowerCase().split(" ")[0])
+      o.t.toLowerCase().includes(geo.district.toLowerCase().split(" ")[0]) ||
+      geo.district.toLowerCase().includes(o.t.toLowerCase().split(" ")[0])
     );
-    if (!distMatch || !distMatch.v) {
-      console.log("District not found:", district, "Available:", distOpts.slice(0,5).map(o=>o.t));
-      return null;
+    if (!distMatch) {
+      return res.json({ success: false, message: `District "${geo.district}" not found in MeeBhoomi. Try manual search.`, location: geo });
     }
-    console.log("District matched:", distMatch.t);
+    console.log("District:", distMatch.t);
 
-    // Step 2: Select district
-    const page2 = await axios.post(
-      "https://meebhoomi.ap.gov.in/Adangal.aspx",
+    // Select district
+    const page2 = await axios.post("https://meebhoomi.ap.gov.in/Adangal.aspx",
       new URLSearchParams({
         "__EVENTTARGET": "ctl00$ContentPlaceHolder1$DropDownList1",
         "__EVENTARGUMENT": "",
-        "__VIEWSTATE": vs,
-        "__VIEWSTATEGENERATOR": vsg,
-        "__EVENTVALIDATION": evv,
+        "__VIEWSTATE": vs, "__VIEWSTATEGENERATOR": vsg, "__EVENTVALIDATION": evv,
         "ctl00$ContentPlaceHolder1$DropDownList1": distMatch.v,
         "ctl00$ContentPlaceHolder1$DropDownList2": "",
         "ctl00$ContentPlaceHolder1$DropDownList3": "",
@@ -133,30 +105,28 @@ async function fetchMeeBhoomi(district, mandal, village) {
     // Get mandal options
     const mandalOpts = [];
     $2("#ctl00_ContentPlaceHolder1_DropDownList2 option").each((i, el) => {
-      mandalOpts.push({ v: $2(el).val(), t: $2(el).text().trim() });
+      const v = $2(el).val();
+      const t = $2(el).text().trim();
+      if (v) mandalOpts.push({ v, t });
     });
-    console.log("Mandals found:", mandalOpts.length);
+    console.log("Mandals:", mandalOpts.length);
 
     const mandalMatch = mandalOpts.find(o =>
-      o.t.toLowerCase().includes(mandal.toLowerCase().split(" ")[0]) ||
-      mandal.toLowerCase().includes(o.t.toLowerCase().split(" ")[0])
-    ) || mandalOpts[1]; // fallback to first real option
+      o.t.toLowerCase().includes(geo.mandal.toLowerCase().split(" ")[0]) ||
+      geo.mandal.toLowerCase().includes(o.t.toLowerCase().split(" ")[0])
+    ) || mandalOpts[0];
 
-    if (!mandalMatch || !mandalMatch.v) {
-      console.log("Mandal not found:", mandal);
-      return null;
+    if (!mandalMatch) {
+      return res.json({ success: false, message: `Mandal "${geo.mandal}" not found.`, location: geo });
     }
-    console.log("Mandal matched:", mandalMatch.t);
+    console.log("Mandal:", mandalMatch.t);
 
-    // Step 3: Select mandal
-    const page3 = await axios.post(
-      "https://meebhoomi.ap.gov.in/Adangal.aspx",
+    // Select mandal
+    const page3 = await axios.post("https://meebhoomi.ap.gov.in/Adangal.aspx",
       new URLSearchParams({
         "__EVENTTARGET": "ctl00$ContentPlaceHolder1$DropDownList2",
         "__EVENTARGUMENT": "",
-        "__VIEWSTATE": vs2,
-        "__VIEWSTATEGENERATOR": vsg,
-        "__EVENTVALIDATION": evv2,
+        "__VIEWSTATE": vs2, "__VIEWSTATEGENERATOR": vsg, "__EVENTVALIDATION": evv2,
         "ctl00$ContentPlaceHolder1$DropDownList1": distMatch.v,
         "ctl00$ContentPlaceHolder1$DropDownList2": mandalMatch.v,
         "ctl00$ContentPlaceHolder1$DropDownList3": "",
@@ -171,30 +141,28 @@ async function fetchMeeBhoomi(district, mandal, village) {
     // Get village options
     const villageOpts = [];
     $3("#ctl00_ContentPlaceHolder1_DropDownList3 option").each((i, el) => {
-      villageOpts.push({ v: $3(el).val(), t: $3(el).text().trim() });
+      const v = $3(el).val();
+      const t = $3(el).text().trim();
+      if (v) villageOpts.push({ v, t });
     });
-    console.log("Villages found:", villageOpts.length);
+    console.log("Villages:", villageOpts.length);
 
     const villageMatch = villageOpts.find(o =>
-      o.t.toLowerCase().includes(village.toLowerCase().split(" ")[0]) ||
-      village.toLowerCase().includes(o.t.toLowerCase().split(" ")[0])
-    ) || villageOpts[1];
+      o.t.toLowerCase().includes(geo.village.toLowerCase().split(" ")[0]) ||
+      geo.village.toLowerCase().includes(o.t.toLowerCase().split(" ")[0])
+    ) || villageOpts[0];
 
-    if (!villageMatch || !villageMatch.v) {
-      console.log("Village not found:", village);
-      return null;
+    if (!villageMatch) {
+      return res.json({ success: false, message: `Village "${geo.village}" not found.`, location: geo });
     }
-    console.log("Village matched:", villageMatch.t);
+    console.log("Village:", villageMatch.t);
 
-    // Step 4: Select village + entire village radio
-    const page4 = await axios.post(
-      "https://meebhoomi.ap.gov.in/Adangal.aspx",
+    // Select village
+    const page4 = await axios.post("https://meebhoomi.ap.gov.in/Adangal.aspx",
       new URLSearchParams({
         "__EVENTTARGET": "ctl00$ContentPlaceHolder1$DropDownList3",
         "__EVENTARGUMENT": "",
-        "__VIEWSTATE": vs3,
-        "__VIEWSTATEGENERATOR": vsg,
-        "__EVENTVALIDATION": evv3,
+        "__VIEWSTATE": vs3, "__VIEWSTATEGENERATOR": vsg, "__EVENTVALIDATION": evv3,
         "ctl00$ContentPlaceHolder1$DropDownList1": distMatch.v,
         "ctl00$ContentPlaceHolder1$DropDownList2": mandalMatch.v,
         "ctl00$ContentPlaceHolder1$DropDownList3": villageMatch.v,
@@ -206,129 +174,321 @@ async function fetchMeeBhoomi(district, mandal, village) {
     const vs4 = $4("#__VIEWSTATE").val() || vs3;
     const evv4 = $4("#__EVENTVALIDATION").val() || evv3;
 
-    // Get captcha image URL
-    const captchaImgSrc = $4("img[id*='aptcha'], img[id*='Captcha']").attr("src") || "";
-    const captchaImgUrl = captchaImgSrc ? `https://meebhoomi.ap.gov.in/${captchaImgSrc.replace(/^\//, "")}` : "";
-    console.log("Captcha image:", captchaImgUrl);
+    // Get captcha image
+    let captchaBase64 = "";
+    const captchaImgSrc = $4("img[id*='aptcha'], img[id*='Captcha'], img[id*='CAPTCHA']").attr("src") || "";
+    console.log("Captcha src:", captchaImgSrc);
 
-    // Solve captcha
-    let captchaSolution = "";
-    if (captchaImgUrl && CAPTCHA_KEY) {
-      captchaSolution = await solveCaptcha(captchaImgUrl, cookies) || "";
+    if (captchaImgSrc) {
+      const captchaUrl = captchaImgSrc.startsWith("http") ? captchaImgSrc :
+        `https://meebhoomi.ap.gov.in/${captchaImgSrc.replace(/^\//, "")}`;
+      try {
+        const imgRes = await axios.get(captchaUrl, {
+          responseType: "arraybuffer",
+          headers: { ...headers, "Cookie": cookies, "Referer": "https://meebhoomi.ap.gov.in/Adangal.aspx" },
+          timeout: 10000
+        });
+        captchaBase64 = Buffer.from(imgRes.data).toString("base64");
+        console.log("Captcha image downloaded, size:", captchaBase64.length);
+      } catch(e) {
+        console.log("Captcha image download failed:", e.message);
+      }
     }
 
-    if (!captchaSolution) {
-      console.log("Could not solve captcha");
-      return null;
-    }
+    // Save session
+    const sessionId = Date.now().toString();
+    sessions[sessionId] = {
+      cookies, vs: vs4, evv: evv4, vsg,
+      distVal: distMatch.v, mandalVal: mandalMatch.v, villageVal: villageMatch.v,
+      distName: distMatch.t, mandalName: mandalMatch.t, villageName: villageMatch.t,
+      location: geo, created: Date.now()
+    };
 
-    // Step 5: Submit form with entire village
-    const submitData = new URLSearchParams({
-      "__EVENTTARGET": "",
-      "__EVENTARGUMENT": "",
-      "__VIEWSTATE": vs4,
-      "__VIEWSTATEGENERATOR": vsg,
-      "__EVENTVALIDATION": evv4,
-      "ctl00$ContentPlaceHolder1$DropDownList1": distMatch.v,
-      "ctl00$ContentPlaceHolder1$DropDownList2": mandalMatch.v,
-      "ctl00$ContentPlaceHolder1$DropDownList3": villageMatch.v,
-      "ctl00$ContentPlaceHolder1$RadioButtonList1": "2", // Entire village
-      "ctl00$ContentPlaceHolder1$TextBox1": captchaSolution,
-      "ctl00$ContentPlaceHolder1$Button1": "Click",
+    // Clean old sessions
+    Object.keys(sessions).forEach(k => {
+      if (Date.now() - sessions[k].created > 300000) delete sessions[k];
     });
 
-    console.log("Submitting form with captcha:", captchaSolution);
-    const result = await axios.post(
-      "https://meebhoomi.ap.gov.in/Adangal.aspx",
-      submitData.toString(),
-      { headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", "Cookie": cookies, "Referer": "https://meebhoomi.ap.gov.in/Adangal.aspx" }, timeout: 25000 }
+    res.json({
+      success: true,
+      sessionId,
+      captchaImage: captchaBase64 ? `data:image/png;base64,${captchaBase64}` : "",
+      location: geo,
+      detected: {
+        district: distMatch.t,
+        mandal: mandalMatch.t,
+        village: villageMatch.t
+      },
+      message: captchaBase64 ? "Captcha ready! Enter the code shown." : "No captcha found — try submitting directly."
+    });
+
+  } catch(e) {
+    console.error("get-captcha error:", e.message);
+    res.json({ success: false, message: `Error: ${e.message}` });
+  }
+});
+
+// ── STEP 2: Submit captcha → Get real data ─────────────────
+app.post("/submit-captcha", async (req, res) => {
+  const { sessionId, captcha } = req.body;
+  if (!sessionId || !captcha) return res.status(400).json({ error: "sessionId and captcha required" });
+
+  const session = sessions[sessionId];
+  if (!session) return res.status(400).json({ error: "Session expired. Please try again." });
+
+  console.log(`\n=== Submit Captcha: ${captcha} ===`);
+
+  try {
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Cookie": session.cookies,
+      "Referer": "https://meebhoomi.ap.gov.in/Adangal.aspx"
+    };
+
+    // Submit form
+    const result = await axios.post("https://meebhoomi.ap.gov.in/Adangal.aspx",
+      new URLSearchParams({
+        "__EVENTTARGET": "",
+        "__EVENTARGUMENT": "",
+        "__VIEWSTATE": session.vs,
+        "__VIEWSTATEGENERATOR": session.vsg,
+        "__EVENTVALIDATION": session.evv,
+        "ctl00$ContentPlaceHolder1$DropDownList1": session.distVal,
+        "ctl00$ContentPlaceHolder1$DropDownList2": session.mandalVal,
+        "ctl00$ContentPlaceHolder1$DropDownList3": session.villageVal,
+        "ctl00$ContentPlaceHolder1$RadioButtonList1": "2",
+        "ctl00$ContentPlaceHolder1$TextBox1": captcha,
+        "ctl00$ContentPlaceHolder1$Button1": "Click",
+      }).toString(),
+      { headers, timeout: 25000 }
     );
 
-    // Parse results
-    const $5 = cheerio.load(result.data);
-    const plots = [];
+    const $ = cheerio.load(result.data);
 
-    $5("table tr").each((i, row) => {
+    // Check for wrong captcha
+    const errorMsg = $("span[id*='Label'], .error, #error").text().toLowerCase();
+    if (errorMsg.includes("wrong") || errorMsg.includes("invalid") || errorMsg.includes("incorrect")) {
+      return res.json({ success: false, message: "Wrong captcha! Please try again.", wrongCaptcha: true });
+    }
+
+    // Extract plots
+    const plots = [];
+    $("table tr").each((i, row) => {
       if (i === 0) return;
-      const cells = $5(row).find("td");
+      const cells = $(row).find("td");
       if (cells.length >= 2) {
-        const survey = $5(cells[0]).text().trim();
-        const owner = $5(cells[1]).text().trim();
-        const extent = $5(cells[2]).text().trim() || $5(cells[3]).text().trim();
-        if (survey && owner && survey !== "Survey No" && owner.length > 1) {
-          plots.push({
-            surveyNumber: survey,
-            ownerName: owner,
-            extent: extent || "—",
-            landType: "Agricultural",
-            village: villageMatch.t,
-            mandal: mandalMatch.t,
-            district: distMatch.t
-          });
+        const survey = $(cells[0]).text().trim();
+        const owner = $(cells[1]).text().trim();
+        const extent = $(cells[2]).text().trim() || $(cells[3]).text().trim();
+        const landType = $(cells[4]).text().trim() || "Agricultural";
+        if (survey && owner && survey.length > 1 && owner.length > 1 &&
+            !survey.toLowerCase().includes("survey") && !owner.toLowerCase().includes("owner")) {
+          plots.push({ surveyNumber:survey, ownerName:owner, extent:extent||"—", landType,
+            village:session.villageName, mandal:session.mandalName, district:session.distName,
+            lat:session.location.lat, lon:session.location.lon });
         }
       }
     });
 
     console.log("Real plots found:", plots.length);
-    return plots.length > 0 ? plots : null;
+    delete sessions[sessionId];
+
+    if (plots.length > 0) {
+      res.json({ success: true, source: "meebhoomi_live", plots,
+        message: `✅ ${plots.length} real plots from MeeBhoomi!` });
+    } else {
+      res.json({ success: false, message: "No plots found. Captcha may be wrong or village has no records.", plots: [] });
+    }
 
   } catch(e) {
-    console.log("MeeBhoomi fetch error:", e.message);
-    return null;
+    console.error("submit-captcha error:", e.message);
+    res.json({ success: false, message: `Submission error: ${e.message}` });
   }
-}
-
-// ── Demo data ──────────────────────────────────────────────
-function getDemoPlots() {
-  return [
-    { surveyNumber:"441/2A", ownerName:"Ravi Kumar Reddy", extent:"2.50 Acres", landType:"Agricultural", riskLevel:"Low", riskScore:12, soilType:"Black Cotton Soil", waterSource:"Canal Irrigation", cropGrown:"Paddy", marketValue:"₹45,00,000", ecStatus:"Clear", bankLoan:"No loan", courtCase:"No disputes", boundaries:{north:"Survey 441/1",south:"Canal Road",east:"Survey 442",west:"Village Road"}, previousOwners:["Gopal Rao (1985-2001)","Suresh Rao (2001-2015)","Ravi Kumar Reddy (2015-Now)"] },
-    { surveyNumber:"441/3", ownerName:"Suresh Rao", extent:"1.20 Acres", landType:"Agricultural", riskLevel:"Medium", riskScore:44, soilType:"Red Soil", waterSource:"Borewell", cropGrown:"Cotton", marketValue:"₹22,00,000", ecStatus:"Clear", bankLoan:"No loan", courtCase:"Minor dispute", boundaries:{north:"Survey 441/2A",south:"Road",east:"Survey 442",west:"Field"}, previousOwners:["Hanumaiah (1980-2005)","Suresh Rao (2005-Now)"] },
-    { surveyNumber:"442/1", ownerName:"Lakshmi Devi", extent:"0.80 Acres", landType:"Residential", riskLevel:"High", riskScore:78, soilType:"Black Soil", waterSource:"None", cropGrown:"None", marketValue:"₹85,00,000", ecStatus:"⚠ Gap 2005-2012", bankLoan:"⚠ SBI Mortgage", courtCase:"⚠ Dispute pending", boundaries:{north:"Road",south:"Building",east:"Survey 443",west:"Survey 441"}, previousOwners:["Ramaiah (1990-2005)","UNKNOWN (2005-2012)","Lakshmi Devi (2012-Now)"] },
-    { surveyNumber:"443/2B", ownerName:"Venkata Subba Rao", extent:"3.75 Acres", landType:"Agricultural", riskLevel:"Low", riskScore:18, soilType:"Alluvial Soil", waterSource:"Canal + Borewell", cropGrown:"Cotton, Chilli", marketValue:"₹62,00,000", ecStatus:"Clear", bankLoan:"No loan", courtCase:"No disputes", boundaries:{north:"Survey 443/1",south:"Survey 444",east:"Canal",west:"Village Path"}, previousOwners:["Hanumaiah (1978-1999)","Venkata Subba Rao (1999-Now)"] },
-    { surveyNumber:"444/1A", ownerName:"Hanumaiah Naidu", extent:"1.50 Acres", landType:"Agricultural", riskLevel:"Low", riskScore:8, soilType:"Sandy Loam", waterSource:"Rain-fed", cropGrown:"Groundnut", marketValue:"₹18,00,000", ecStatus:"Clear", bankLoan:"No loan", courtCase:"No disputes", boundaries:{north:"Survey 443",south:"Survey 445",east:"Road",west:"Field"}, previousOwners:["Hanumaiah Naidu (1970-Now)"] },
-  ];
-}
-
-// ── MAIN ───────────────────────────────────────────────────
-app.get("/gps-to-land", async (req, res) => {
-  const { lat, lon } = req.query;
-  if (!lat || !lon) return res.status(400).json({ error: "lat and lon required" });
-
-  console.log(`\n=== GPS: ${lat}, ${lon} ===`);
-  const geo = await reverseGeocode(lat, lon);
-  console.log("Location:", geo.village, geo.district);
-
-  let plots = null;
-  let source = "demo";
-
-  if (CAPTCHA_KEY && geo.village && geo.district) {
-    console.log("Attempting real MeeBhoomi fetch...");
-    plots = await fetchMeeBhoomi(geo.district, geo.mandal, geo.village);
-    if (plots) source = "meebhoomi_live";
-  }
-
-  if (!plots) {
-    plots = getDemoPlots();
-    source = "demo";
-  }
-
-  res.json({
-    success: true,
-    source,
-    location: { ...geo, lat: parseFloat(lat), lon: parseFloat(lon) },
-    plots,
-    message: source === "meebhoomi_live" ? "✅ Real MeeBhoomi data!" : `Demo data shown for ${geo.village || "your location"}`
-  });
 });
 
-app.get("/health", (req, res) => res.json({
-  status: "ok", captcha: !!CAPTCHA_KEY,
-  mode: CAPTCHA_KEY ? "REAL DATA MODE" : "DEMO MODE"
-}));
+app.get("/health", (req, res) => res.json({ status:"ok", mode:"SEMI-AUTO — User solves captcha!" }));
+app.get("/", (req, res) => res.json({ name:"LandCheck MeeBhoomi Semi-Auto v4" }));
 
-app.get("/", (req, res) => res.json({ name: "LandCheck MeeBhoomi GPS Service v3" }));
+app.listen(PORT, () => console.log(`✅ LandCheck on port ${PORT} — Semi-Auto Mode!`));
 
-app.listen(PORT, () => {
-  console.log(`✅ LandCheck MeeBhoomi on port ${PORT}`);
-  console.log(CAPTCHA_KEY ? "🟢 REAL DATA MODE" : "🔴 DEMO MODE");
+// ── STEP 3: Get full individual Adangal by survey number ───
+app.get("/get-adangal-captcha", async (req, res) => {
+  const { district, mandal, village, surveyNo } = req.query;
+  if (!district || !village || !surveyNo) return res.status(400).json({ error: "district, village, surveyNo required" });
+
+  console.log(`\n=== Get Adangal Captcha: ${surveyNo} in ${village} ===`);
+
+  try {
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "te-IN,te;q=0.9,en-US;q=0.8",
+      "Connection": "keep-alive",
+    };
+
+    // Load MeeBhoomi Adangal page
+    const page1 = await axios.get("https://meebhoomi.ap.gov.in/Adangal.aspx", { headers, timeout: 20000 });
+    const cookies = page1.headers["set-cookie"]?.map(c => c.split(";")[0]).join("; ") || "";
+    const $ = cheerio.load(page1.data);
+
+    const vs = $("#__VIEWSTATE").val() || "";
+    const evv = $("#__EVENTVALIDATION").val() || "";
+    const vsg = $("#__VIEWSTATEGENERATOR").val() || "";
+    if (!vs) return res.json({ success: false, message: "MeeBhoomi not loading" });
+
+    // Match and select district
+    const distOpts = [];
+    $("#ctl00_ContentPlaceHolder1_DropDownList1 option").each((i, el) => {
+      const v = $(el).val(); const t = $(el).text().trim();
+      if (v) distOpts.push({ v, t });
+    });
+    const distMatch = distOpts.find(o =>
+      o.t.toLowerCase().includes(district.toLowerCase().split(" ")[0]) ||
+      district.toLowerCase().includes(o.t.toLowerCase().split(" ")[0])
+    );
+    if (!distMatch) return res.json({ success: false, message: `District ${district} not found` });
+
+    const page2 = await axios.post("https://meebhoomi.ap.gov.in/Adangal.aspx",
+      new URLSearchParams({ "__EVENTTARGET": "ctl00$ContentPlaceHolder1$DropDownList1", "__EVENTARGUMENT": "", "__VIEWSTATE": vs, "__VIEWSTATEGENERATOR": vsg, "__EVENTVALIDATION": evv, "ctl00$ContentPlaceHolder1$DropDownList1": distMatch.v, "ctl00$ContentPlaceHolder1$DropDownList2": "", "ctl00$ContentPlaceHolder1$DropDownList3": "" }).toString(),
+      { headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", "Cookie": cookies, "Referer": "https://meebhoomi.ap.gov.in/Adangal.aspx" }, timeout: 20000 }
+    );
+
+    const $2 = cheerio.load(page2.data);
+    const vs2 = $2("#__VIEWSTATE").val() || vs;
+    const evv2 = $2("#__EVENTVALIDATION").val() || evv;
+
+    const mandalOpts = [];
+    $2("#ctl00_ContentPlaceHolder1_DropDownList2 option").each((i, el) => { const v=$2(el).val(); const t=$2(el).text().trim(); if(v) mandalOpts.push({v,t}); });
+    const mandalMatch = mandalOpts.find(o => o.t.toLowerCase().includes(mandal.toLowerCase().split(" ")[0])) || mandalOpts[0];
+
+    const page3 = await axios.post("https://meebhoomi.ap.gov.in/Adangal.aspx",
+      new URLSearchParams({ "__EVENTTARGET": "ctl00$ContentPlaceHolder1$DropDownList2", "__EVENTARGUMENT": "", "__VIEWSTATE": vs2, "__VIEWSTATEGENERATOR": vsg, "__EVENTVALIDATION": evv2, "ctl00$ContentPlaceHolder1$DropDownList1": distMatch.v, "ctl00$ContentPlaceHolder1$DropDownList2": mandalMatch.v, "ctl00$ContentPlaceHolder1$DropDownList3": "" }).toString(),
+      { headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", "Cookie": cookies, "Referer": "https://meebhoomi.ap.gov.in/Adangal.aspx" }, timeout: 20000 }
+    );
+
+    const $3 = cheerio.load(page3.data);
+    const vs3 = $3("#__VIEWSTATE").val() || vs2;
+    const evv3 = $3("#__EVENTVALIDATION").val() || evv2;
+
+    const villageOpts = [];
+    $3("#ctl00_ContentPlaceHolder1_DropDownList3 option").each((i, el) => { const v=$3(el).val(); const t=$3(el).text().trim(); if(v) villageOpts.push({v,t}); });
+    const villageMatch = villageOpts.find(o => o.t.toLowerCase().includes(village.toLowerCase().split(" ")[0])) || villageOpts[0];
+
+    const page4 = await axios.post("https://meebhoomi.ap.gov.in/Adangal.aspx",
+      new URLSearchParams({ "__EVENTTARGET": "ctl00$ContentPlaceHolder1$DropDownList3", "__EVENTARGUMENT": "", "__VIEWSTATE": vs3, "__VIEWSTATEGENERATOR": vsg, "__EVENTVALIDATION": evv3, "ctl00$ContentPlaceHolder1$DropDownList1": distMatch.v, "ctl00$ContentPlaceHolder1$DropDownList2": mandalMatch.v, "ctl00$ContentPlaceHolder1$DropDownList3": villageMatch.v }).toString(),
+      { headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", "Cookie": cookies, "Referer": "https://meebhoomi.ap.gov.in/Adangal.aspx" }, timeout: 20000 }
+    );
+
+    const $4 = cheerio.load(page4.data);
+    const vs4 = $4("#__VIEWSTATE").val() || vs3;
+    const evv4 = $4("#__EVENTVALIDATION").val() || evv3;
+
+    // Get captcha
+    let captchaBase64 = "";
+    const captchaImgSrc = $4("img[id*='aptcha'], img[id*='Captcha']").attr("src") || "";
+    if (captchaImgSrc) {
+      const captchaUrl = captchaImgSrc.startsWith("http") ? captchaImgSrc : `https://meebhoomi.ap.gov.in/${captchaImgSrc.replace(/^\//, "")}`;
+      try {
+        const imgRes = await axios.get(captchaUrl, { responseType: "arraybuffer", headers: { ...headers, "Cookie": cookies }, timeout: 10000 });
+        captchaBase64 = Buffer.from(imgRes.data).toString("base64");
+      } catch(e) { console.log("Captcha img error:", e.message); }
+    }
+
+    const sessionId = "adangal_" + Date.now().toString();
+    sessions[sessionId] = {
+      cookies, vs: vs4, evv: evv4, vsg,
+      distVal: distMatch.v, mandalVal: mandalMatch.v, villageVal: villageMatch.v,
+      distName: distMatch.t, mandalName: mandalMatch.t, villageName: villageMatch.t,
+      surveyNo, created: Date.now()
+    };
+
+    res.json({
+      success: true, sessionId,
+      captchaImage: captchaBase64 ? `data:image/png;base64,${captchaBase64}` : "",
+      message: "Enter captcha to get full land details!"
+    });
+
+  } catch(e) {
+    console.error("adangal-captcha error:", e.message);
+    res.json({ success: false, message: e.message });
+  }
+});
+
+// ── STEP 4: Submit adangal captcha → get full details ──────
+app.post("/submit-adangal", async (req, res) => {
+  const { sessionId, captcha } = req.body;
+  const session = sessions[sessionId];
+  if (!session) return res.status(400).json({ error: "Session expired" });
+
+  console.log(`\n=== Submit Adangal: ${captcha} for survey ${session.surveyNo} ===`);
+
+  try {
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Cookie": session.cookies,
+      "Referer": "https://meebhoomi.ap.gov.in/Adangal.aspx"
+    };
+
+    const result = await axios.post("https://meebhoomi.ap.gov.in/Adangal.aspx",
+      new URLSearchParams({
+        "__EVENTTARGET": "", "__EVENTARGUMENT": "",
+        "__VIEWSTATE": session.vs, "__VIEWSTATEGENERATOR": session.vsg, "__EVENTVALIDATION": session.evv,
+        "ctl00$ContentPlaceHolder1$DropDownList1": session.distVal,
+        "ctl00$ContentPlaceHolder1$DropDownList2": session.mandalVal,
+        "ctl00$ContentPlaceHolder1$DropDownList3": session.villageVal,
+        "ctl00$ContentPlaceHolder1$RadioButtonList1": "1", // One survey number
+        "ctl00$ContentPlaceHolder1$TextBox1": session.surveyNo,
+        "ctl00$ContentPlaceHolder1$TextBox2": captcha,
+        "ctl00$ContentPlaceHolder1$Button1": "Click",
+      }).toString(),
+      { headers, timeout: 25000 }
+    );
+
+    const $ = cheerio.load(result.data);
+
+    // Extract ALL details from adangal
+    const details = {};
+    $("table tr").each((i, row) => {
+      const cells = $(row).find("td");
+      if (cells.length >= 2) {
+        const key = $(cells[0]).text().trim().toLowerCase();
+        const val = $(cells[1]).text().trim();
+        if (key && val) details[key] = val;
+      }
+    });
+
+    console.log("Adangal details found:", Object.keys(details).length, details);
+
+    // Map to our fields
+    const fullData = {
+      ownerName: details["pattadar name"] || details["owner name"] || details["పట్టాదారు పేరు"] || "",
+      surveyNumber: session.surveyNo,
+      extent: details["extent"] || details["area"] || details["విస్తీర్ణం"] || "",
+      landType: details["land type"] || details["nature of land"] || "Agricultural",
+      soilType: details["soil type"] || details["నేల రకం"] || details["soil"] || "—",
+      waterSource: details["water source"] || details["నీటి వనరు"] || details["irrigation"] || "—",
+      cropGrown: details["crop"] || details["పంట"] || details["crop grown"] || "—",
+      khataNumber: details["khata no"] || details["account no"] || "—",
+      pattadarNumber: details["pattadar no"] || "—",
+      village: session.villageName,
+      mandal: session.mandalName,
+      district: session.distName,
+      source: "meebhoomi_live",
+      rawData: details
+    };
+
+    delete sessions[sessionId];
+
+    if (Object.keys(details).length > 0) {
+      res.json({ success: true, data: fullData, message: "✅ Real full Adangal data!" });
+    } else {
+      res.json({ success: false, message: "Wrong captcha or no data found.", wrongCaptcha: true });
+    }
+
+  } catch(e) {
+    console.error("submit-adangal error:", e.message);
+    res.json({ success: false, message: e.message });
+  }
 });
